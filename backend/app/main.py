@@ -1,0 +1,162 @@
+import os
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from sqlalchemy import text, inspect
+from backend.app.db.session import engine, Base
+from backend.app.routers import analysis
+from backend.app.routers import deepfake as deepfake_router
+from backend.app.services.inference import inference_service
+from backend.app.services.deepfake_inference import deepfake_service
+from backend.app.services.deepfake_video_inference import video_deepfake_service
+from backend.app.schemas.schemas import HealthResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("image_quality_api")
+
+UPLOAD_DIR = os.getenv(
+    "UPLOAD_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
+)
+os.makedirs(os.path.join(UPLOAD_DIR, "images"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "heatmaps"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "deepfake", "images"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "deepfake", "heatmaps"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "deepfake", "videos"), exist_ok=True)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Initializing database tables...")
+    Base.metadata.create_all(bind=engine)
+
+    # Automatic schema migration for existing deployments
+    try:
+        inspector = inspect(engine)
+        if "analysis_results" in inspector.get_table_names():
+            columns = [c["name"] for c in inspector.get_columns("analysis_results")]
+            if "session_id" not in columns:
+                logger.info("Migrating database: adding missing 'session_id' column to 'analysis_results' table...")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE analysis_results ADD COLUMN session_id VARCHAR(64)"))
+                    try:
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_analysis_results_session_id ON analysis_results (session_id)"))
+                    except Exception:
+                        pass
+                logger.info("Database migration completed successfully.")
+    except Exception as e:
+        logger.warning(f"Auto-migration check encountered non-fatal error: {e}")
+
+    logger.info("Loading PyTorch CV models into memory...")
+    try:
+        inference_service.load_models()
+        logger.info("Quality Assessment models loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load quality models during startup: {e}", exc_info=True)
+
+    try:
+        deepfake_service.load_models()
+        logger.info("Deepfake Detection models loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load deepfake models during startup: {e}", exc_info=True)
+
+    try:
+        video_deepfake_service.load_models()
+        logger.info("Video Deepfake Detection models loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load video deepfake models during startup: {e}", exc_info=True)
+
+    yield
+    
+    logger.info("Shutting down Image Forensics Suite service...")
+
+app = FastAPI(
+    title="PixelShamer — AI Image Quality & Defect Detection API",
+    description="Full-stack AI/CV REST API for evaluating digital image visual quality, detecting degradations, and localizing defects.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+cors_origins_str = os.getenv("CORS_ORIGINS", "*")
+if cors_origins_str == "*":
+    cors_origins = ["*"]
+    allow_creds = False
+else:
+    cors_origins = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
+    allow_creds = True
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=allow_creds,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+app.include_router(analysis.router)
+app.include_router(deepfake_router.router)
+
+# Allowed CORS origins for the exception handler (must match app CORSMiddleware)
+_CORS_ALLOWED_ORIGINS = set(os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173").split(","))
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error processing {request.url.path}: {str(exc)}", exc_info=True)
+
+    # Only reflect origin if it is in the configured whitelist (prevents CORS origin reflection attacks)
+    request_origin = request.headers.get("origin", "")
+    safe_origin = request_origin if request_origin in _CORS_ALLOWED_ORIGINS else "null"
+
+    response = JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred. Please try again."}
+    )
+    if safe_origin and safe_origin != "null":
+        response.headers["Access-Control-Allow-Origin"] = safe_origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+@app.api_route("/api/health", methods=["GET", "HEAD"], response_model=HealthResponse, tags=["System"])
+@app.api_route("/health", methods=["GET", "HEAD"], response_model=HealthResponse, tags=["System"])
+async def health_check():
+    """Health check endpoint exposing service readiness and model loading status for both pipelines."""
+    return HealthResponse(
+        status="ok",
+        version="1.2.0",
+        models_loaded=inference_service.is_ready,
+        deepfake_models_loaded=deepfake_service.is_ready,
+        details={
+            "environment": os.getenv("APP_ENV", "development"),
+            "quality_device": str(inference_service.device),
+            "deepfake_device": str(deepfake_service.device),
+            "video_deepfake_models_loaded": video_deepfake_service.is_ready,
+            "video_deepfake_device": str(video_deepfake_service.device)
+        }
+    )
+
+FRONTEND_DIST = os.getenv("FRONTEND_DIST", "")
+
+if FRONTEND_DIST and os.path.exists(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    @app.api_route("/", methods=["GET", "HEAD"], tags=["System"])
+    async def root():
+        return {
+            "message": "AI Image Quality & Defect Detection API is active.",
+            "docs": "/docs",
+            "health": "/api/health"
+        }
